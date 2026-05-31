@@ -1,4 +1,4 @@
-name            = "streamcast-proxy"
+name = "streamcast-worker"
 main            = "worker.js"
 compatibility_date = "2025-01-01"
 
