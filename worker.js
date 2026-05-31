@@ -205,4 +205,3 @@ export default {
     return errorResponse('Not found. Valid endpoints: /stocking, /flow, /health', 404);
   }
 };
-        
