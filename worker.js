@@ -1,24 +1,54 @@
 /**
- * StreamCast Proxy Worker v1.1
- * 
+ * StreamCast Proxy Worker v1.2
+ * Correct ArcGIS field names confirmed from /fields endpoint.
+ *
  * Endpoints:
- *   GET /stocking?river=Credit River   (single river)
- *   GET /stocking                      (all rivers, sequential)
+ *   GET /stocking?river=Credit River   single river
+ *   GET /stocking                      all 15 StreamCast rivers
  *   GET /flow?station=02HB001
+ *   GET /fields                        diagnostic
  *   GET /health
  */
 
 const ARCGIS_BASE = 'https://services1.arcgis.com/TJH5KDher0W13Kgo/arcgis/rest/services/FishStockingDataForRecreationalPurposes/FeatureServer/0/query';
 const EC_FLOW_BASE = 'https://api.weather.gc.ca/collections/hydrometric-realtime/items';
 
-const CACHE_TTL_STOCKING = 86400; // 24h
+const CACHE_TTL_STOCKING = 86400; // 24h — stocking data updated a few times/year
 const CACHE_TTL_FLOW     = 300;   // 5min
 
+// Correct field names from ArcGIS (confirmed via /fields)
+// Note: "Unoffcial" is a typo in the source data — kept as-is
+const F = {
+  district:    'MNRF_District',
+  year:        'Stocking_Year',
+  species:     'Species',
+  nameOfficial:'Official_Waterbody_Name',
+  nameUnofficial:'Unoffcial_Waterbody_Name',  // typo in source
+  wbid:        'Waterbody_Location_Identifier',
+  stage:       'Developmental_Stage',
+  quantity:    'Number_of_Fish_Stocked',
+  lat:         'Latitude',
+  lng:         'Longitude',
+};
+
+// StreamCast rivers — search keyword maps to what appears in waterbody name fields
+// Using the first distinctive word of each river name
 const STREAMCAST_RIVERS = [
-  'Credit River', 'Grand River', 'Humber River', 'Bronte Creek',
-  'Duffins Creek', 'Rouge River', 'Sixteen Mile Creek', 'Ganaraska River',
-  'Beaver River', 'Saugeen River', 'Nottawasaga River', 'Speed River',
-  'Eramosa River', 'Bowmanville Creek', 'Wilmot Creek'
+  { name: 'Credit River',       keyword: 'Credit' },
+  { name: 'Grand River',        keyword: 'Grand'  },
+  { name: 'Humber River',       keyword: 'Humber' },
+  { name: 'Bronte Creek',       keyword: 'Bronte' },
+  { name: 'Duffins Creek',      keyword: 'Duffin' },
+  { name: 'Rouge River',        keyword: 'Rouge'  },
+  { name: 'Sixteen Mile Creek', keyword: 'Sixteen Mile' },
+  { name: 'Ganaraska River',    keyword: 'Ganaraska' },
+  { name: 'Beaver River',       keyword: 'Beaver' },
+  { name: 'Saugeen River',      keyword: 'Saugeen' },
+  { name: 'Nottawasaga River',  keyword: 'Nottawasaga' },
+  { name: 'Speed River',        keyword: 'Speed'  },
+  { name: 'Eramosa River',      keyword: 'Eramosa' },
+  { name: 'Bowmanville Creek',  keyword: 'Bowmanville' },
+  { name: 'Wilmot Creek',       keyword: 'Wilmot' },
 ];
 
 const CORS = {
@@ -37,23 +67,20 @@ function errorResponse(msg, status = 500) {
   return jsonResponse({ error: msg }, status);
 }
 
-// Query ArcGIS for a single river name
-async function fetchStockingForRiver(riverName) {
-  // ArcGIS requires simple equality or single LIKE — use exact name match first
-  // The waterbody names in the DB use title case e.g. "CREDIT RIVER" or "Credit River"
-  // Use a simple LIKE with just the key word to be safe
-  const keyword = riverName.split(' ')[0]; // e.g. "Credit" from "Credit River"
-  
+// Query ArcGIS for a single river using keyword match on both name fields
+async function fetchStockingForRiver({ name, keyword }) {
+  // Search both the official and unofficial name fields
+  const where = `${F.nameOfficial} LIKE '%${keyword}%' OR ${F.nameUnofficial} LIKE '%${keyword}%'`;
+
   const params = new URLSearchParams({
-    where: `WATERBODY_NAME LIKE '${keyword}%'`,
-    outFields: 'WATERBODY_NAME,YEAR,SPECIES,SIZE_GROUP,QUANTITY,STOCKING_DATE',
-    orderByFields: 'YEAR DESC',
-    resultRecordCount: '100',
+    where,
+    outFields: [F.year, F.species, F.nameOfficial, F.nameUnofficial, F.stage, F.quantity, F.district].join(','),
+    orderByFields: `${F.year} DESC`,
+    resultRecordCount: '200',
     f: 'json',
   });
 
-  const url = `${ARCGIS_BASE}?${params}`;
-  const res = await fetch(url, {
+  const res = await fetch(`${ARCGIS_BASE}?${params}`, {
     headers: { 'Accept': 'application/json', 'User-Agent': 'StreamCast/1.0' }
   });
 
@@ -63,23 +90,22 @@ async function fetchStockingForRiver(riverName) {
   return data.features || [];
 }
 
-// Summarise raw features into per-species most-recent records
 function summarise(features, riverName) {
   if (!features.length) return null;
 
+  // Group by species — keep most recent stocking per species
   const perSpecies = {};
   features.forEach(f => {
     const p = f.attributes;
-    const sp = p.SPECIES || p.FISH_SPECIES || 'Unknown';
-    const yr = p.YEAR || 0;
+    const sp = p[F.species] || 'Unknown';
+    const yr = p[F.year]    || 0;
     if (!perSpecies[sp] || yr > perSpecies[sp].year) {
       perSpecies[sp] = {
-        species:  sp,
-        year:     yr,
-        size:     p.SIZE_GROUP || p.SIZE || null,
-        quantity: p.QUANTITY || null,
-        date:     p.STOCKING_DATE ? new Date(p.STOCKING_DATE).toISOString().slice(0,10) : null,
-        waterbody: p.WATERBODY_NAME || riverName,
+        species:      sp,
+        year:         yr,
+        stage:        p[F.stage]    || null,  // e.g. "Yearlings", "Fry", "Adults"
+        quantity:     p[F.quantity] || null,
+        waterbody:    p[F.nameOfficial] || p[F.nameUnofficial] || riverName,
       };
     }
   });
@@ -89,19 +115,24 @@ function summarise(features, riverName) {
 
   return {
     stockedSpecies,
-    lastStocked: stockedSpecies[0]?.date || null,
     mostRecentYear: stockedSpecies[0]?.year || null,
-    totalRecords: features.length,
+    totalRecords:   features.length,
   };
 }
 
-// ── /stocking handler ─────────────────────────────────────────────────────────
+// ── /stocking ─────────────────────────────────────────────────────────────────
 async function handleStocking(url, ctx) {
-  const singleRiver = url.searchParams.get('river');
-  const rivers = singleRiver ? [singleRiver] : STREAMCAST_RIVERS;
+  const singleRiverName = url.searchParams.get('river');
+  const rivers = singleRiverName
+    ? STREAMCAST_RIVERS.filter(r => r.name === singleRiverName)
+    : STREAMCAST_RIVERS;
+
+  if (singleRiverName && !rivers.length) {
+    return errorResponse(`Unknown river: ${singleRiverName}. Valid rivers: ${STREAMCAST_RIVERS.map(r=>r.name).join(', ')}`, 400);
+  }
 
   const cacheKey = new Request(
-    `https://cache.streamcast/stocking-v2?rivers=${rivers.join(',')}`
+    `https://cache.streamcast/stocking-v3?rivers=${rivers.map(r=>r.name).join(',')}`
   );
   const cache = caches.default;
   const cached = await cache.match(cacheKey);
@@ -109,14 +140,13 @@ async function handleStocking(url, ctx) {
 
   const result = { updated: new Date().toISOString(), rivers: {}, errors: {} };
 
-  // Query rivers sequentially to avoid hammering ArcGIS
   for (const river of rivers) {
     try {
       const features = await fetchStockingForRiver(river);
-      const summary  = summarise(features, river);
-      if (summary) result.rivers[river] = summary;
+      const summary  = summarise(features, river.name);
+      result.rivers[river.name] = summary || { stockedSpecies: [], mostRecentYear: null, totalRecords: 0, note: 'No stocking records found' };
     } catch (e) {
-      result.errors[river] = e.message;
+      result.errors[river.name] = e.message;
     }
   }
 
@@ -125,7 +155,7 @@ async function handleStocking(url, ctx) {
   return response;
 }
 
-// ── /flow handler ─────────────────────────────────────────────────────────────
+// ── /flow ─────────────────────────────────────────────────────────────────────
 async function handleFlow(url, ctx) {
   const station = url.searchParams.get('station');
   if (!station) return errorResponse('Missing ?station= parameter', 400);
@@ -182,15 +212,12 @@ async function handleFlow(url, ctx) {
     : flow > prev + 0.05 ? 'up'
     : flow < prev - 0.05 ? 'down' : 'stable';
 
-  const response = jsonResponse(
-    { flow, trend, at: readings[0].at, station },
-    200, CACHE_TTL_FLOW
-  );
+  const response = jsonResponse({ flow, trend, at: readings[0].at, station }, 200, CACHE_TTL_FLOW);
   ctx.waitUntil(cache.put(cacheKey, response.clone()));
   return response;
 }
 
-// ── /fields handler — inspect ArcGIS field names ──────────────────────────────
+// ── /fields (diagnostic) ──────────────────────────────────────────────────────
 async function handleFields() {
   const res = await fetch(`${ARCGIS_BASE}?where=1%3D1&outFields=*&resultRecordCount=1&f=json`, {
     headers: { 'Accept': 'application/json', 'User-Agent': 'StreamCast/1.0' }
@@ -202,21 +229,18 @@ async function handleFields() {
   return jsonResponse({ fields, sample: data.features?.[0]?.attributes || null });
 }
 
-// ── Main router ───────────────────────────────────────────────────────────────
+// ── Router ────────────────────────────────────────────────────────────────────
 export default {
   async fetch(request, env, ctx) {
     if (request.method === 'OPTIONS') {
       return new Response(null, { status: 204, headers: CORS });
     }
-
     const url  = new URL(request.url);
     const path = url.pathname;
-
-    if (path === '/health')   return jsonResponse({ status: 'ok', version: '1.1.0', ts: new Date().toISOString() });
+    if (path === '/health')   return jsonResponse({ status: 'ok', version: '1.2.0', ts: new Date().toISOString() });
     if (path === '/stocking') return handleStocking(url, ctx);
     if (path === '/flow')     return handleFlow(url, ctx);
-    if (path === '/fields')   return handleFields();   // diagnostic — check ArcGIS field names
-
+    if (path === '/fields')   return handleFields();
     return jsonResponse({ error: 'Valid endpoints: /stocking, /flow, /health, /fields' }, 404);
   }
 };
