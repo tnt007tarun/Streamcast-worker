@@ -1,5 +1,5 @@
 /**
- * StreamCast Proxy Worker v1.2
+ * StreamCast Proxy Worker v1.2.1
  * Correct ArcGIS field names confirmed from /fields endpoint.
  *
  * Endpoints:
@@ -53,7 +53,7 @@ const STREAMCAST_RIVERS = [
 
 const CORS = {
   'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'GET, OPTIONS',
+  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type',
 };
 
@@ -236,7 +236,74 @@ export default {
       return new Response(null, { status: 204, headers: CORS });
     }
     const url  = new URL(request.url);
-    const path = url.pathname;
+  
+  // ── EMAIL SUBSCRIPTION ─────────────────────────────────────────────────────
+  if (url.pathname === '/subscribe') {
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { status: 204, headers: CORS });
+    }
+    if (request.method !== 'POST') {
+      return new Response(JSON.stringify({ error: 'POST only' }), { status: 405, headers: { ...CORS, 'Content-Type': 'application/json' } });
+    }
+    try {
+      const body    = await request.json();
+      const { email, rivers, species, source } = body;
+
+      if (!email || !email.includes('@')) {
+        return new Response(JSON.stringify({ error: 'Valid email required' }), { status: 400, headers: { ...CORS, 'Content-Type': 'application/json' } });
+      }
+
+      const clean = email.toLowerCase().trim();
+      const ts    = new Date().toISOString();
+
+      // 1. Save preferences to KV
+      await env.SUBSCRIBERS.put('sub:' + clean, JSON.stringify({
+        email: clean, rivers: rivers || [], species: species || [],
+        source: source || 'notify-panel', createdAt: ts, confirmed: false,
+      }));
+
+      // 2. Add to Resend audience
+      await fetch('https://api.resend.com/audiences/' + env.RESEND_AUDIENCE_ID + '/contacts', {
+        method: 'POST',
+        headers: { 'Authorization': 'Bearer ' + env.RESEND_API_KEY, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: clean,
+          data: { rivers: (rivers||[]).join(', '), species: (species||[]).join(', '), source: source || 'notify-panel' },
+          unsubscribed: false,
+        }),
+      });
+
+      // 3. Send welcome email
+      await fetch('https://api.resend.com/emails', {
+        method: 'POST',
+        headers: { 'Authorization': 'Bearer ' + env.RESEND_API_KEY, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          from:    'HereFishyFishy <hello@herefishyfishy.ca>',
+          to:      [clean],
+          subject: "You're on the list 🎣",
+          html: `<div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;color:#1a2e3a">
+            <h2 style="color:#1e7a6e">You're on the list.</h2>
+            <p>We'll send you an alert when conditions are excellent for
+            <strong>${(species||[]).join(', ') || 'your target species'}</strong>
+            on the <strong>${(rivers||[]).join(', ') || 'rivers you follow'}</strong>.</p>
+            <p>In the meantime, check conditions any time at
+            <a href="https://herefishyfishy.ca" style="color:#1e7a6e">herefishyfishy.ca</a>.</p>
+            <p style="color:#999;font-size:11px;margin-top:32px">
+              <a href="https://herefishyfishy.ca/unsubscribe?email=${encodeURIComponent(clean)}" style="color:#999">Unsubscribe</a>
+            </p>
+          </div>`,
+        }),
+      });
+
+      return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { ...CORS, 'Content-Type': 'application/json' } });
+
+    } catch (err) {
+      return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: { ...CORS, 'Content-Type': 'application/json' } });
+    }
+  }
+  // ── END EMAIL SUBSCRIPTION ──────────────────────────────────────────────────
+
+  const path = url.pathname;
     if (path === '/health')   return jsonResponse({ status: 'ok', version: '1.2.0', ts: new Date().toISOString() });
     if (path === '/stocking') return handleStocking(url, ctx);
     if (path === '/flow')     return handleFlow(url, ctx);
