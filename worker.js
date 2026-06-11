@@ -1,5 +1,5 @@
 /**
- * StreamCast Proxy Worker v1.2.1
+ * StreamCast Proxy Worker v1.3.0
  * Correct ArcGIS field names confirmed from /fields endpoint.
  *
  * Endpoints:
@@ -15,6 +15,26 @@ const EC_FLOW_BASE = 'https://api.weather.gc.ca/collections/hydrometric-realtime
 
 const CACHE_TTL_STOCKING = 86400; // 24h — stocking data updated a few times/year
 const CACHE_TTL_FLOW     = 300;   // 5min
+const CACHE_TTL_LAKE     = 86400; // 24h — GLSEA lake surface temp updates daily
+
+// GLERL ERDDAP — Great Lakes Surface Environmental Analysis (satellite SST, daily, ~1.3km)
+const ERDDAP_GLSEA = 'https://apps.glerl.noaa.gov/erddap/griddap/GLSEA_ACSPO_GCS.json';
+
+// River-mouth offshore sample points (pushed into the lake so the grid cell is water,
+// not land). key matches STAGING_ZONES[...].key in the app. Each samples a small
+// bbox and averages the valid (non-fill) water cells.
+const LAKE_MOUTH_POINTS = [
+  { key: 'credit',      lat: 43.54, lng: -79.58 },
+  { key: 'humber',      lat: 43.61, lng: -79.47 },
+  { key: 'ganaraska',   lat: 43.915, lng: -78.29 },
+  { key: 'bowmanville', lat: 43.87, lng: -78.685 },
+  { key: 'wilmot',      lat: 43.885, lng: -78.59 },
+  { key: 'bronte',      lat: 43.37, lng: -79.715 },
+  { key: 'sixteen',     lat: 43.415, lng: -79.665 },
+  { key: 'rouge',       lat: 43.78, lng: -79.13 },
+  { key: 'duffins',     lat: 43.81, lng: -79.06 },
+  { key: 'nottawasaga', lat: 44.52, lng: -80.01 },
+];
 
 // Correct field names from ArcGIS (confirmed via /fields)
 // Note: "Unoffcial" is a typo in the source data — kept as-is
@@ -229,6 +249,53 @@ async function handleFields() {
   return jsonResponse({ fields, sample: data.features?.[0]?.attributes || null });
 }
 
+
+// ── /lake-temps ────────────────────────────────────────────────────────────────
+// Returns {credit: 18.3, rouge: 17.9, ...} — daily lake surface temp at each mouth.
+// Queries GLERL ERDDAP GLSEA gridded SST. Land/cloud cells return the fill value
+// (-99999); we sample a small offshore bbox per mouth and average valid water cells.
+async function handleLakeTemps(url, ctx) {
+  const cacheKey = new Request('https://cache.streamcast/lake-temps-v1');
+  const cache = caches.default;
+  const cached = await cache.match(cacheKey);
+  if (cached) return cached;
+
+  const FILL = -9999; // anything <= this is land/cloud/no-data
+  const out = {};
+
+  // Query each mouth: a 3x3-ish bbox around the offshore point, latest time.
+  // ERDDAP griddap subset syntax: sst[(time)][(latMin):(latMax)][(lngMin):(lngMax)]
+  await Promise.all(LAKE_MOUTH_POINTS.map(async (m) => {
+    const d = 0.03; // ~3km half-box, a few grid cells
+    const q = ERDDAP_GLSEA + '?sst[(last)][(' +
+      (m.lat - d) + '):(' + (m.lat + d) + ')][(' +
+      (m.lng - d) + '):(' + (m.lng + d) + ')]';
+    try {
+      const r = await fetch(q, { headers: { 'Accept': 'application/json', 'User-Agent': 'HereFishyFishy/1.0' } });
+      if (!r.ok) { out[m.key] = null; return; }
+      const j = await r.json();
+      // ERDDAP JSON: { table: { columnNames:[...], rows:[[time,lat,lng,sst],...] } }
+      const rows = (j && j.table && j.table.rows) ? j.table.rows : [];
+      const sstIdx = j.table.columnNames.indexOf('sst');
+      const vals = rows
+        .map(row => parseFloat(row[sstIdx]))
+        .filter(v => !isNaN(v) && v > FILL);
+      if (vals.length) {
+        const avg = vals.reduce((a, b) => a + b, 0) / vals.length;
+        out[m.key] = Math.round(avg * 10) / 10;
+      } else {
+        out[m.key] = null; // all land/cloud — no reading
+      }
+    } catch (e) {
+      out[m.key] = null;
+    }
+  }));
+
+  const response = jsonResponse({ updated: new Date().toISOString(), temps: out }, 200, CACHE_TTL_LAKE);
+  ctx.waitUntil(cache.put(cacheKey, response.clone()));
+  return response;
+}
+
 // ── Router ────────────────────────────────────────────────────────────────────
 export default {
   async fetch(request, env, ctx) {
@@ -304,10 +371,11 @@ export default {
   // ── END EMAIL SUBSCRIPTION ──────────────────────────────────────────────────
     
   const path = url.pathname;
-    if (path === '/health')   return jsonResponse({ status: 'ok', version: '1.2.0', ts: new Date().toISOString() });
+    if (path === '/health')   return jsonResponse({ status: 'ok', version: '1.3.0', ts: new Date().toISOString() });
     if (path === '/stocking') return handleStocking(url, ctx);
     if (path === '/flow')     return handleFlow(url, ctx);
     if (path === '/fields')   return handleFields();
-    return jsonResponse({ error: 'Valid endpoints: /stocking, /flow, /health, /fields' }, 404);
+    if (path === '/lake-temps') return handleLakeTemps(url, ctx);
+    return jsonResponse({ error: 'Valid endpoints: /stocking, /flow, /health, /fields, /lake-temps' }, 404);
   }
 };
