@@ -302,16 +302,6 @@ export default {
     }
   }
   // ── END EMAIL SUBSCRIPTION ──────────────────────────────────────────────────
-
-      // ── TEMP DEBUG — remove after testing ──
-  if (url.pathname === '/debug') {
-    return new Response(JSON.stringify({
-      hasSubscribers: !!env.SUBSCRIBERS,
-      hasResendKey:   !!env.RESEND_API_KEY,
-      hasAudienceId:  !!env.RESEND_AUDIENCE_ID,
-    }), { status: 200, headers: { ...CORS, 'Content-Type': 'application/json' } });
-  }
-  // ── END TEMP DEBUG ──
     
   const path = url.pathname;
     if (path === '/health')   return jsonResponse({ status: 'ok', version: '1.2.0', ts: new Date().toISOString() });
