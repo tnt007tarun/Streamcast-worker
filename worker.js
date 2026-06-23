@@ -295,7 +295,7 @@ async function handleLakeTemps(url, ctx) {
   ctx.waitUntil(cache.put(cacheKey, response.clone()));
   return response;
 }
-/ ── ROUTE TABLE ─────────────────────────────────────────────
+// ── ROUTE TABLE ─────────────────────────────────────────────
 // Maps URL slug → river data. One entry per species per river.
 // "bestSection" is which section to pull gauge data from.
 const SSR_ROUTES = {
