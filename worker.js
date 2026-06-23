@@ -295,7 +295,8 @@ async function handleLakeTemps(url, ctx) {
   ctx.waitUntil(cache.put(cacheKey, response.clone()));
   return response;
 }
-// ── ROUTE TABLE ─────────────────────────────────────────────
+
+// ROUTE TABLE 
 // Maps URL slug → river data. One entry per species per river.
 // "bestSection" is which section to pull gauge data from.
 const SSR_ROUTES = {
@@ -401,7 +402,7 @@ const SSR_ROUTES = {
   },
 };
 
-// ── SCORING LOGIC ────────────────────────────────────────────
+// SCORING LOGIC 
 // Simplified version of the app's condition scoring.
 // Returns { quality, label, flowState, tempState, skyState }
 
@@ -464,7 +465,7 @@ function scoreConditions(flow, airTemp, cloudPct, route, month) {
   };
 }
 
-// ── HTML TEMPLATE ────────────────────────────────────────────
+// HTML TEMPLATE 
 function renderSSRPage(route, cond, slug) {
   const speciesSlug = slug.split('/')[1];
   const qualityColor = {
@@ -633,7 +634,7 @@ function renderSSRPage(route, cond, slug) {
 </html>`;
 }
 
-// ── MAIN SSR HANDLER ─────────────────────────────────────────
+// MAIN SSR HANDLER 
 // Call this from the top of your Worker's fetch handler.
 // Returns a Response if the URL matches an SSR route, or null to fall through.
 
