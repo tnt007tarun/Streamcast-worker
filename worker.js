@@ -15,26 +15,50 @@ const EC_FLOW_BASE = 'https://api.weather.gc.ca/collections/hydrometric-realtime
 
 const CACHE_TTL_STOCKING = 86400; // 24h — stocking data updated a few times/year
 const CACHE_TTL_FLOW     = 300;   // 5min
-const CACHE_TTL_LAKE     = 86400; // 24h — GLSEA lake surface temp updates daily
+const CACHE_TTL_LAKE     = 3600;  // 1h — NDBC buoys report hourly
 
-// GLERL ERDDAP — Great Lakes Surface Environmental Analysis (satellite SST, daily, ~1.3km)
-const ERDDAP_GLSEA = 'https://apps.glerl.noaa.gov/erddap/griddap/GLSEA_ACSPO_GCS.json';
+// ── LAKE SURFACE TEMP SOURCE ───────────────────────────────────────────────────
+// Was: GLERL ERDDAP GLSEA_ACSPO_GCS (satellite SST). That dataset stopped
+// publishing ~2026-01-19 (its time_coverage_end confirms it) and returned null
+// for every zone. Replaced with NDBC buoys, which are actively maintained and
+// report hourly.
+//
+//   45139  West Lake Ontario   43.250N  79.530W   35m  (ECCC 3m discus)
+//   45012  East Lake Ontario   43.621N  77.401W  143m  (NOAA 2.3m foam discus)
+//   45143  South Georgian Bay  44.940N  80.627W   50m  (ECCC 3m discus)
+//
+// CAVEAT: these sit offshore in deep water. In summer they read a few degrees
+// COOLER than the nearshore harbour water where salmon actually stage, so a
+// correction is applied below. During a strong upwelling the offshore reading
+// can instead run WARM (that's where the displaced surface water went) — the
+// app's staging model handles that separately via its wind/Ekman factor.
+//
+// WINTER: Great Lakes buoys are pulled for ice roughly Dec–Apr. During that
+// window this returns nulls and the app falls back to monthly climatology.
+const NDBC_BASE = 'https://www.ndbc.noaa.gov/data/realtime2/';
 
-// River-mouth offshore sample points (pushed into the lake so the grid cell is water,
-// not land). key matches STAGING_ZONES[...].key in the app. Each samples a small
-// bbox and averages the valid (non-fill) water cells.
-const LAKE_MOUTH_POINTS = [
-  { key: 'credit',      lat: 43.54, lng: -79.58 },
-  { key: 'humber',      lat: 43.61, lng: -79.47 },
-  { key: 'ganaraska',   lat: 43.915, lng: -78.29 },
-  { key: 'bowmanville', lat: 43.87, lng: -78.685 },
-  { key: 'wilmot',      lat: 43.885, lng: -78.59 },
-  { key: 'bronte',      lat: 43.37, lng: -79.715 },
-  { key: 'sixteen',     lat: 43.415, lng: -79.665 },
-  { key: 'rouge',       lat: 43.78, lng: -79.13 },
-  { key: 'duffins',     lat: 43.81, lng: -79.06 },
-  { key: 'nottawasaga', lat: 44.52, lng: -80.01 },
-];
+const BUOYS = {
+  west:     '45139',
+  east:     '45012',
+  georgian: '45143',
+};
+
+// Each staging zone key -> nearest buoy. Keys match STAGING_ZONES[...].key in the app.
+const ZONE_BUOY = {
+  credit:      'west',
+  humber:      'west',
+  bronte:      'west',
+  sixteen:     'west',
+  rouge:       'west',
+  duffins:     'west',
+  bowmanville: 'west',
+  wilmot:      'west',
+  ganaraska:   'east',
+  nottawasaga: 'georgian',
+};
+
+const NEARSHORE_OFFSET_C = 1.5; // offshore buoy -> nearshore correction
+const BUOY_MAX_AGE_HOURS = 12;  // ignore readings older than this
 
 // Correct field names from ArcGIS (confirmed via /fields)
 // Note: "Unoffcial" is a typo in the source data — kept as-is
@@ -251,48 +275,97 @@ async function handleFields() {
 
 
 // ── /lake-temps ────────────────────────────────────────────────────────────────
-// Returns {credit: 18.3, rouge: 17.9, ...} — daily lake surface temp at each mouth.
-// Queries GLERL ERDDAP GLSEA gridded SST. Land/cloud cells return the fill value
-// (-99999); we sample a small offshore bbox per mouth and average valid water cells.
+// Returns {credit: 18.3, rouge: 17.9, ...} — lake surface temp near each river
+// mouth, sourced from the nearest NDBC buoy.
+//
+// NDBC realtime2 .txt format: two '#' header lines, then newest-first rows.
+// 'MM' means missing.
+//   #YY  MM DD hh mm WDIR WSPD GST WVHT DPD APD MWD PRES ATMP WTMP DEWP VIS ...
+function parseBuoyWtmp(text) {
+  if (!text) return null;
+  const lines = text.split('\n').filter(l => l.trim().length > 0);
+  if (lines.length < 3) return null;
+
+  // Read the WTMP column from the header rather than hardcoding an index —
+  // NDBC has changed column layouts over the years.
+  const header = lines[0].replace(/^#/, '').trim().split(/\s+/);
+  let wtmpIdx = header.indexOf('WTMP');
+  if (wtmpIdx === -1) wtmpIdx = 14; // documented fallback position
+
+  const now = Date.now();
+
+  for (const line of lines) {
+    if (line.startsWith('#')) continue;
+    const f = line.trim().split(/\s+/);
+    if (f.length <= wtmpIdx) continue;
+
+    const raw = f[wtmpIdx];
+    if (!raw || raw === 'MM') continue;
+
+    const val = parseFloat(raw);
+    if (!isFinite(val) || val < -5 || val > 35) continue; // sanity bounds
+
+    // Row timestamp is UTC: YY MM DD hh mm
+    const ts = Date.UTC(
+      parseInt(f[0], 10), parseInt(f[1], 10) - 1, parseInt(f[2], 10),
+      parseInt(f[3], 10), parseInt(f[4], 10)
+    );
+    if (!isFinite(ts)) continue;
+    if ((now - ts) > BUOY_MAX_AGE_HOURS * 3600 * 1000) return null; // stale
+
+    return Math.round((val + NEARSHORE_OFFSET_C) * 10) / 10;
+  }
+  return null;
+}
+
+async function fetchBuoyTemp(stationId) {
+  try {
+    const r = await fetch(NDBC_BASE + stationId + '.txt', {
+      cf: { cacheTtl: 1800, cacheEverything: true },
+      headers: { 'User-Agent': 'HereFishyFishy/1.0 (herefishyfishy.ca)' },
+    });
+    if (!r.ok) return null;
+    return parseBuoyWtmp(await r.text());
+  } catch (e) {
+    return null;
+  }
+}
+
 async function handleLakeTemps(url, ctx) {
-  const cacheKey = new Request('https://cache.streamcast/lake-temps-v1');
+  // v2 key — the v1 entry holds the old all-nulls GLSEA payload.
+  const cacheKey = new Request('https://cache.streamcast/lake-temps-v2');
   const cache = caches.default;
   const cached = await cache.match(cacheKey);
   if (cached) return cached;
 
-  const FILL = -9999; // anything <= this is land/cloud/no-data
+  // Fetch all three buoys in parallel
+  const ids = Object.keys(BUOYS);
+  const results = await Promise.all(ids.map(k => fetchBuoyTemp(BUOYS[k])));
+  const byBuoy = {};
+  ids.forEach((k, i) => { byBuoy[k] = results[i]; });
+
+  // Map buoy readings onto zone keys
   const out = {};
+  for (const zone of Object.keys(ZONE_BUOY)) {
+    const t = byBuoy[ZONE_BUOY[zone]];
+    out[zone] = (t == null ? null : t);
+  }
 
-  // Query each mouth: a 3x3-ish bbox around the offshore point, latest time.
-  // ERDDAP griddap subset syntax: sst[(time)][(latMin):(latMax)][(lngMin):(lngMax)]
-  await Promise.all(LAKE_MOUTH_POINTS.map(async (m) => {
-    const d = 0.03; // ~3km half-box, a few grid cells
-    const q = ERDDAP_GLSEA + '?sst[(last)][(' +
-      (m.lat - d) + '):(' + (m.lat + d) + ')][(' +
-      (m.lng - d) + '):(' + (m.lng + d) + ')]';
-    try {
-      const r = await fetch(q, { headers: { 'Accept': 'application/json', 'User-Agent': 'HereFishyFishy/1.0' } });
-      if (!r.ok) { out[m.key] = null; return; }
-      const j = await r.json();
-      // ERDDAP JSON: { table: { columnNames:[...], rows:[[time,lat,lng,sst],...] } }
-      const rows = (j && j.table && j.table.rows) ? j.table.rows : [];
-      const sstIdx = j.table.columnNames.indexOf('sst');
-      const vals = rows
-        .map(row => parseFloat(row[sstIdx]))
-        .filter(v => !isNaN(v) && v > FILL);
-      if (vals.length) {
-        const avg = vals.reduce((a, b) => a + b, 0) / vals.length;
-        out[m.key] = Math.round(avg * 10) / 10;
-      } else {
-        out[m.key] = null; // all land/cloud — no reading
-      }
-    } catch (e) {
-      out[m.key] = null;
-    }
-  }));
+  const payload = {
+    updated: new Date().toISOString(),
+    source: 'NDBC buoys 45139 (west Lk Ontario) / 45012 (east Lk Ontario) / 45143 (S Georgian Bay)',
+    nearshoreOffsetC: NEARSHORE_OFFSET_C,
+    buoys: byBuoy,
+    temps: out,
+  };
 
-  const response = jsonResponse({ updated: new Date().toISOString(), temps: out }, 200, CACHE_TTL_LAKE);
-  ctx.waitUntil(cache.put(cacheKey, response.clone()));
+  const response = jsonResponse(payload, 200, CACHE_TTL_LAKE);
+
+  // Only cache when at least one buoy returned data — otherwise a transient
+  // outage would be frozen in the cache for the full TTL.
+  if (Object.values(byBuoy).some(v => v != null)) {
+    ctx.waitUntil(cache.put(cacheKey, response.clone()));
+  }
   return response;
 }
 
@@ -796,7 +869,7 @@ export default {
   // ── END EMAIL SUBSCRIPTION ──────────────────────────────────────────────────
     
   const path = url.pathname;
-    if (path === '/health')   return jsonResponse({ status: 'ok', version: '1.3.0', ts: new Date().toISOString() });
+    if (path === '/health')   return jsonResponse({ status: 'ok', version: '1.4.0', ts: new Date().toISOString() });
     if (path === '/stocking') return handleStocking(url, ctx);
     if (path === '/flow')     return handleFlow(url, ctx);
     if (path === '/fields')   return handleFields();
